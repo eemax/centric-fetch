@@ -1,0 +1,4 @@
+/centric-fetch
+*.db
+*.db-*
+*.lock

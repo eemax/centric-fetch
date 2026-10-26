@@ -1,0 +1,19 @@
+[Unit]
+Description=centric-fetch: full fetch from Centric PLM (flags deletions), then database upkeep
+Documentation=https://github.com/eemax/centric-fetch
+After=network-online.target
+Wants=network-online.target
+# No Conflicts= with the incremental unit: that would stop a running fetch. The lock refuses
+# a second concurrent one instead (exit 2).
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/centric-fetch fetch --config /etc/centric-fetch/config.json --full --maintain
+TimeoutStartSec=4h
+TimeoutStopSec=60
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/centric-fetch

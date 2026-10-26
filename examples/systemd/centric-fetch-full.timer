@@ -1,0 +1,9 @@
+[Unit]
+Description=centric-fetch full fetch, Sunday 01:00 UTC (replaces that day's incremental)
+
+[Timer]
+OnCalendar=Sun *-*-* 01:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

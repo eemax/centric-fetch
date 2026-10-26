@@ -1,0 +1,23 @@
+{
+  "database": "/var/lib/centric-fetch/centric.db",
+  "env_file": "/etc/centric-fetch/centric.env",
+  "endpoints": [
+    "seasons",
+    "styles",
+    "colorways",
+    "materials",
+    "boms",
+    "bom_lines",
+    "suppliers",
+    "supplier_quotes"
+  ],
+  "concurrency": 3,
+  "overlap_minutes": 10,
+  "endpoint_retry_after_seconds": 60,
+  "http": {
+    "timeout_seconds": 90,
+    "attempts": 6,
+    "backoff_base_seconds": 10,
+    "backoff_max_seconds": 120
+  }
+}
