@@ -10,12 +10,15 @@
 package fetch
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"strconv"
@@ -38,6 +41,11 @@ const (
 	// massDeleteFloor) unless AllowMassDelete: more looks like a Centric problem, not deletions.
 	massDeleteShare = 0.10
 	massDeleteFloor = 10
+	// An outcome lists at most this many of the fields that changed silently, counted over at
+	// most silentSample records per endpoint and run (comparing costs a parse of each stored
+	// payload; one event in Centric can change tens of thousands of records silently).
+	silentFieldsShown = 10
+	silentSample      = 1000
 )
 
 // Options for one run.
@@ -52,27 +60,32 @@ type Options struct {
 
 // Outcome is what one endpoint's fetch did.
 type Outcome struct {
-	Endpoint   string   `json:"endpoint"`
-	Mode       string   `json:"mode"`
-	Status     string   `json:"status"` // ok, warn, failed
-	Resumed    bool     `json:"resumed,omitempty"`
-	DeltaFloor string   `json:"delta_floor,omitempty"`
-	Expected   *int     `json:"expected,omitempty"`
-	Fetched    int      `json:"fetched"`
-	Inserted   int      `json:"inserted"`
-	Updated    int      `json:"updated"`
-	Unchanged  int      `json:"unchanged"`
-	Restored   int      `json:"restored"`
-	Deleted    int      `json:"deleted"`
-	Missing    int      `json:"missing"`
-	Passes     int      `json:"passes"`
-	Complete   bool     `json:"complete"`
-	Retries    int      `json:"retries"`
-	Attempts   int      `json:"attempts"`
-	Seconds    float64  `json:"seconds"`
-	Notes      []string `json:"notes,omitempty"`
-	Warnings   []string `json:"warnings,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	Endpoint   string `json:"endpoint"`
+	Mode       string `json:"mode"`
+	Status     string `json:"status"` // ok, warn, failed
+	Resumed    bool   `json:"resumed,omitempty"`
+	DeltaFloor string `json:"delta_floor,omitempty"`
+	Expected   *int   `json:"expected,omitempty"`
+	Fetched    int    `json:"fetched"`
+	Inserted   int    `json:"inserted"`
+	Updated    int    `json:"updated"`
+	Unchanged  int    `json:"unchanged"`
+	Restored   int    `json:"restored"`
+	Deleted    int    `json:"deleted"`
+	Missing    int    `json:"missing"`
+	// Updated records whose _modified_at didn't move, and the fields that changed most in the
+	// first SilentSampled of them.
+	Silent        int            `json:"silent"`
+	SilentSampled int            `json:"silent_sampled,omitempty"`
+	SilentFields  map[string]int `json:"silent_fields,omitempty"`
+	Passes        int            `json:"passes"`
+	Complete      bool           `json:"complete"`
+	Retries       int            `json:"retries"`
+	Attempts      int            `json:"attempts"`
+	Seconds       float64        `json:"seconds"`
+	Notes         []string       `json:"notes,omitempty"`
+	Warnings      []string       `json:"warnings,omitempty"`
+	Error         string         `json:"error,omitempty"`
 
 	counts    store.PageCounts
 	startedAt string
@@ -98,13 +111,13 @@ type Summary struct {
 
 // Totals sums the endpoints.
 type Totals struct {
-	Fetched, Inserted, Updated, Unchanged, Restored, Deleted, Missing int
+	Fetched, Inserted, Updated, Unchanged, Restored, Deleted, Missing, Silent int
 }
 
 // MarshalJSON keeps the keys lower case like the rest of the summary.
 func (t Totals) MarshalJSON() ([]byte, error) {
-	return fmt.Appendf(nil, `{"fetched":%d,"inserted":%d,"updated":%d,"unchanged":%d,"restored":%d,"deleted":%d,"missing":%d}`,
-		t.Fetched, t.Inserted, t.Updated, t.Unchanged, t.Restored, t.Deleted, t.Missing), nil
+	return fmt.Appendf(nil, `{"fetched":%d,"inserted":%d,"updated":%d,"unchanged":%d,"restored":%d,"deleted":%d,"missing":%d,"silent":%d}`,
+		t.Fetched, t.Inserted, t.Updated, t.Unchanged, t.Restored, t.Deleted, t.Missing, t.Silent), nil
 }
 
 // ErrStopped wraps the run's error when it was cancelled (a signal).
@@ -150,6 +163,21 @@ func Run(ctx context.Context, db *store.DB, client *centric.Client, cfg *config.
 		return err
 	}); err != nil {
 		return nil, err
+	}
+
+	// --restart drops unfinished windows once, here: the in-run retry below resumes where the
+	// first try stopped.
+	if opts.Restart {
+		if err := db.Tx(func(tx *sql.Tx) error {
+			for _, ep := range selected {
+				if err := dropWindows(tx, ep.Name, ""); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	// An authentication failure stops everything: no endpoint can work.
@@ -208,6 +236,7 @@ func Run(ctx context.Context, db *store.DB, client *centric.Client, cfg *config.
 		sum.Totals.Restored += o.Restored
 		sum.Totals.Deleted += o.Deleted
 		sum.Totals.Missing += o.Missing
+		sum.Totals.Silent += o.Silent
 	}
 	sum.RecordsChanged = sum.Totals.Inserted + sum.Totals.Updated + sum.Totals.Restored + sum.Totals.Deleted
 	if sum.ChangeSeqAfter, err = db.LatestChangeSeq(); err != nil {
@@ -276,13 +305,7 @@ type window struct {
 
 type endpointState struct {
 	lastSuccessStarted sql.NullString
-	pendingRunID       sql.NullString
-	pendingMode        sql.NullString
-	pendingPass        sql.NullInt64
-	pendingStarted     sql.NullString
-	pendingFloor       sql.NullString
-	pendingSkip        sql.NullInt64
-	pendingFetched     sql.NullInt64
+	pending            map[string]*window // unfinished windows by mode
 }
 
 // endpoint fetches one endpoint and records its outcome. It never returns an error: what
@@ -318,7 +341,7 @@ func (r *runner) endpoint(ctx context.Context, ep config.Endpoint, abort context
 		o.Seconds = round1(time.Since(began).Seconds())
 		o.finished = store.Iso(r.now())
 		r.log("%s: FAILED %s", ep.Name, o.Error)
-		if err := r.recordFailure(ep.Name, o.Error, keepPending); err != nil {
+		if err := r.recordFailure(ep.Name, o.Mode, o.Error, keepPending); err != nil {
 			r.log("%s: recording failure: %v", ep.Name, err)
 		}
 		if err := r.recordOutcome(o); err != nil {
@@ -399,28 +422,24 @@ func (r *runner) endpoint(ctx context.Context, ep config.Endpoint, abort context
 	return o
 }
 
-// openWindow resumes the endpoint's unfinished window, or opens a new one. An unfinished
-// full window also serves an incremental request, since it covers more.
+// openWindow resumes the endpoint's unfinished window, or opens a new one. Each mode keeps
+// its own unfinished window; an unfinished full window also serves an incremental request,
+// since it covers more.
 func (r *runner) openWindow(s endpointState, now time.Time) (*window, string) {
 	requested := "delta"
 	if r.opts.Full {
 		requested = "full"
 	}
-	if s.pendingRunID.Valid && !r.opts.Restart && (s.pendingMode.String == requested || s.pendingMode.String == "full") {
-		pass := int(s.pendingPass.Int64)
-		if pass < 1 {
-			pass = 1
+	for _, mode := range []string{"full", requested} {
+		if w := s.pending[mode]; w != nil {
+			w.resumed = true
+			w.changedSince = r.changedSince(w.startedAt)
+			// A verification pass starts from the top: it has to see the whole window.
+			if w.pass > 1 {
+				w.skip, w.fetched = 0, 0
+			}
+			return w, ""
 		}
-		w := &window{
-			runID: s.pendingRunID.String, mode: s.pendingMode.String, startedAt: s.pendingStarted.String,
-			deltaFloor: s.pendingFloor.String, pass: pass, resumed: true,
-			changedSince: r.changedSince(s.pendingStarted.String),
-		}
-		// A verification pass starts from the top: it has to see the whole window.
-		if pass == 1 {
-			w.skip, w.fetched = int(s.pendingSkip.Int64), int(s.pendingFetched.Int64)
-		}
-		return w, ""
 	}
 	floor, warning := "", ""
 	if requested == "delta" && s.lastSuccessStarted.Valid {
@@ -586,7 +605,7 @@ func (r *runner) readPass(ctx context.Context, call *caller, w *window, params u
 				return err
 			}
 			page := store.Page{Endpoint: ep.Name, Items: items, RunID: w.runID, Now: store.Iso(r.now()),
-				ChangeSeq: seq, ChangedSince: w.changedSince}
+				ChangeSeq: seq, ChangedSince: w.changedSince, SilentSample: silentSample - o.counts.SilentSampled}
 			if w.pass > 1 {
 				page.WindowStartedAt = w.startedAt
 			}
@@ -701,6 +720,17 @@ func (r *runner) finishWindow(ep config.Endpoint, w *window, o *Outcome, found [
 				return err
 			}
 		}
+		// A finished full window also ends an unfinished incremental one. Resuming that would
+		// misjudge it: the full re-stamped its records with another run's id, so they'd look
+		// like duplicates and late finds. Nothing is lost, since an unfinished window never moved
+		// the cursor: the next incremental run opens one from the same floor.
+		drop := w.mode
+		if w.mode == "full" {
+			drop = ""
+		}
+		if err := dropWindows(tx, ep.Name, drop); err != nil {
+			return err
+		}
 		status := "ok"
 		if len(o.Warnings) > 0 {
 			status = "warn"
@@ -708,48 +738,66 @@ func (r *runner) finishWindow(ep config.Endpoint, w *window, o *Outcome, found [
 		_, err := tx.Exec(`UPDATE meta_endpoint_state
 			SET last_success_finished_at = ?, last_success_mode = ?,
 			    last_full_success_at = CASE WHEN ? = 'full' THEN ? ELSE last_full_success_at END,
-			    last_attempt_status = ?, last_attempt_error = NULL,
-			    pending_run_id = NULL, pending_mode = NULL, pending_pass = NULL, pending_started_at = NULL,
-			    pending_delta_floor = NULL, pending_next_skip = NULL, pending_fetched = NULL
-			WHERE endpoint = ?`, now, w.mode, w.mode, now, status, ep.Name)
+			    last_incremental_success_at = CASE WHEN ? = 'delta' THEN ? ELSE last_incremental_success_at END,
+			    last_attempt_status = ?, last_attempt_error = NULL
+			WHERE endpoint = ?`, now, w.mode, w.mode, now, w.mode, now, status, ep.Name)
 		return err
 	})
 }
 
 func savePosition(tx *sql.Tx, endpoint string, w *window) error {
-	_, err := tx.Exec(`UPDATE meta_endpoint_state SET pending_run_id = ?, pending_mode = ?, pending_pass = ?,
-		pending_started_at = ?, pending_delta_floor = ?, pending_next_skip = ?, pending_fetched = ?
-		WHERE endpoint = ?`, w.runID, w.mode, w.pass, w.startedAt, nullString(w.deltaFloor), w.skip, w.fetched, endpoint)
+	_, err := tx.Exec(`INSERT OR REPLACE INTO meta_windows (endpoint, mode, run_id, pass, started_at,
+		delta_floor, next_skip, fetched) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		endpoint, w.mode, w.runID, w.pass, w.startedAt, nullString(w.deltaFloor), w.skip, w.fetched)
+	return err
+}
+
+// dropWindows forgets an endpoint's unfinished window of mode, or all of them for "".
+func dropWindows(tx *sql.Tx, endpoint, mode string) error {
+	_, err := tx.Exec(`DELETE FROM meta_windows WHERE endpoint = ? AND (? = '' OR mode = ?)`, endpoint, mode, mode)
 	return err
 }
 
 func (r *runner) state(endpoint string) (endpointState, error) {
-	var s endpointState
+	s := endpointState{pending: map[string]*window{}}
 	err := r.db.Tx(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`INSERT INTO meta_endpoint_state (endpoint) VALUES (?) ON CONFLICT DO NOTHING`, endpoint); err != nil {
 			return err
 		}
-		return tx.QueryRow(`SELECT last_success_started_at, pending_run_id, pending_mode, pending_pass,
-			pending_started_at, pending_delta_floor, pending_next_skip, pending_fetched
-			FROM meta_endpoint_state WHERE endpoint = ?`, endpoint).Scan(&s.lastSuccessStarted, &s.pendingRunID,
-			&s.pendingMode, &s.pendingPass, &s.pendingStarted, &s.pendingFloor, &s.pendingSkip, &s.pendingFetched)
+		if err := tx.QueryRow(`SELECT last_success_started_at FROM meta_endpoint_state WHERE endpoint = ?`,
+			endpoint).Scan(&s.lastSuccessStarted); err != nil {
+			return err
+		}
+		rows, err := tx.Query(`SELECT mode, run_id, pass, started_at, delta_floor, next_skip, fetched
+			FROM meta_windows WHERE endpoint = ?`, endpoint)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			w := &window{}
+			var floor sql.NullString
+			if err := rows.Scan(&w.mode, &w.runID, &w.pass, &w.startedAt, &floor, &w.skip, &w.fetched); err != nil {
+				return err
+			}
+			w.deltaFloor, w.pass = floor.String, max(w.pass, 1)
+			s.pending[w.mode] = w
+		}
+		return rows.Err()
 	})
 	return s, err
 }
 
-func (r *runner) recordFailure(endpoint, msg string, keepPending bool) error {
+func (r *runner) recordFailure(endpoint, mode, msg string, keepPending bool) error {
 	return r.db.Tx(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`UPDATE meta_endpoint_state SET last_attempt_status = 'failed', last_attempt_error = ?
 			WHERE endpoint = ?`, msg, endpoint); err != nil {
 			return err
 		}
-		if keepPending {
+		if keepPending || mode == "" {
 			return nil
 		}
-		_, err := tx.Exec(`UPDATE meta_endpoint_state SET pending_run_id = NULL, pending_mode = NULL,
-			pending_pass = NULL, pending_started_at = NULL, pending_delta_floor = NULL,
-			pending_next_skip = NULL, pending_fetched = NULL WHERE endpoint = ?`, endpoint)
-		return err
+		return dropWindows(tx, endpoint, mode)
 	})
 }
 
@@ -758,14 +806,20 @@ func (r *runner) recordOutcome(o *Outcome) error {
 	if o.Expected != nil {
 		expected = *o.Expected
 	}
+	o.SilentFields = topFields(o.counts.SilentFields, silentFieldsShown)
+	var silentFields any
+	if len(o.SilentFields) > 0 {
+		b, _ := json.Marshal(o.SilentFields)
+		silentFields = string(b)
+	}
 	return r.db.Tx(func(tx *sql.Tx) error {
 		_, err := tx.Exec(`INSERT OR REPLACE INTO meta_run_endpoints (run_id, endpoint, mode, delta_floor,
 			resumed, status, expected, fetched, inserted, updated, unchanged, restored, deleted, missing,
-			passes, complete, note, warning, error, started_at, finished_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			silent, silent_fields, passes, complete, note, warning, error, started_at, finished_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			r.runID, o.Endpoint, o.Mode, nullString(o.DeltaFloor), o.Resumed, o.Status, expected, o.Fetched,
-			o.Inserted, o.Updated, o.Unchanged, o.Restored, o.Deleted, o.Missing, o.Passes, o.Complete,
-			nullString(strings.Join(o.Notes, "; ")), nullString(strings.Join(o.Warnings, "; ")),
+			o.Inserted, o.Updated, o.Unchanged, o.Restored, o.Deleted, o.Missing, o.Silent, silentFields,
+			o.Passes, o.Complete, nullString(strings.Join(o.Notes, "; ")), nullString(strings.Join(o.Warnings, "; ")),
 			nullString(o.Error), o.startedAt, nullString(o.finished))
 		return err
 	})
@@ -773,15 +827,43 @@ func (r *runner) recordOutcome(o *Outcome) error {
 
 func (o *Outcome) addCounts(c store.PageCounts) {
 	o.counts.Add(c)
-	o.Inserted, o.Updated, o.Unchanged, o.Restored = o.counts.Inserted, o.counts.Updated, o.counts.Unchanged, o.counts.Restored
+	o.syncCounts()
+}
+
+// syncCounts copies the summed page counts into the outcome's fields. The silent fields are
+// ranked once, when the outcome is recorded.
+func (o *Outcome) syncCounts() {
+	c := o.counts
+	o.Inserted, o.Updated, o.Unchanged, o.Restored = c.Inserted, c.Updated, c.Unchanged, c.Restored
+	o.Silent, o.SilentSampled = c.Silent, c.SilentSampled
+}
+
+// topFields keeps the n most frequent fields (ties by name).
+func topFields(counts map[string]int, n int) map[string]int {
+	if len(counts) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b string) int {
+		return cmp.Or(cmp.Compare(counts[b], counts[a]), cmp.Compare(a, b))
+	})
+	out := map[string]int{}
+	for _, k := range keys[:min(n, len(keys))] {
+		out[k] = counts[k]
+	}
+	return out
 }
 
 // merge folds a retried endpoint's two attempts into one outcome.
 func merge(first, second *Outcome) *Outcome {
 	m := *second
 	m.counts = first.counts
+	m.counts.SilentFields = maps.Clone(first.counts.SilentFields)
 	m.counts.Add(second.counts)
-	m.Inserted, m.Updated, m.Unchanged, m.Restored = m.counts.Inserted, m.counts.Updated, m.counts.Unchanged, m.counts.Restored
+	m.syncCounts()
 	m.Deleted += first.Deleted
 	m.Retries += first.Retries
 	m.Attempts = first.Attempts + second.Attempts

@@ -6,9 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Exit 0 = ok or warn, 1 = partial or failed, 2 = config/credentials/lock. Units that should
-# run after a good fetch can hook in with OnSuccess= in a drop-in.
-ExecStart=/usr/local/bin/centric-fetch fetch --config /etc/centric-fetch/config.json
+# Exit 0 = ok or warn, 1 = partial or failed, 2 = config/credentials, 75 = another fetch
+# still held the lock after --wait. Units that should run after a good fetch can hook in with
+# OnSuccess= in a drop-in. (SuccessExitStatus=75 would hide a skip, but would also start those
+# units while the other fetch is still writing.)
+ExecStart=/usr/local/bin/centric-fetch fetch --config /etc/centric-fetch/config.json --wait 1h
 # A stop (or this timeout) ends it cleanly with exit 143; the next run resumes.
 TimeoutStartSec=90min
 TimeoutStopSec=60

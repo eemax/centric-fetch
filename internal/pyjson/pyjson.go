@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -124,6 +124,13 @@ func Encode(v Value, sortKeys bool) []byte {
 	return b.Bytes()
 }
 
+// EncodeTo is Encode into b, which it resets first: callers encoding many values reuse one
+// buffer.
+func EncodeTo(b *bytes.Buffer, v Value, sortKeys bool) {
+	b.Reset()
+	encode(b, v, sortKeys)
+}
+
 func encode(b *bytes.Buffer, v Value, sortKeys bool) {
 	switch t := v.(type) {
 	case nil:
@@ -148,15 +155,25 @@ func encode(b *bytes.Buffer, v Value, sortKeys bool) {
 		}
 		b.WriteByte(']')
 	case *Object:
+		b.WriteByte('{')
+		if !sortKeys {
+			for i, k := range t.Keys {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				writeString(b, k)
+				b.WriteByte(':')
+				encode(b, t.Values[i], sortKeys)
+			}
+			b.WriteByte('}')
+			return
+		}
 		order := make([]int, len(t.Keys))
 		for i := range order {
 			order[i] = i
 		}
-		if sortKeys {
-			// Byte order of UTF-8 is code point order, which is how Python sorts str.
-			sort.Slice(order, func(i, j int) bool { return t.Keys[order[i]] < t.Keys[order[j]] })
-		}
-		b.WriteByte('{')
+		// Byte order of UTF-8 is code point order, which is how Python sorts str.
+		slices.SortFunc(order, func(i, j int) int { return strings.Compare(t.Keys[i], t.Keys[j]) })
 		for n, i := range order {
 			if n > 0 {
 				b.WriteByte(',')
@@ -175,19 +192,28 @@ func encode(b *bytes.Buffer, v Value, sortKeys bool) {
 // characters only; everything else (including U+2028/U+2029 and DEL) is written raw.
 func writeString(b *bytes.Buffer, s string) {
 	b.WriteByte('"')
+	// Runs of characters written as they are go out in one copy.
+	start := 0
 	for i := 0; i < len(s); {
 		c := s[i]
 		if c >= 0x20 && c != '"' && c != '\\' {
 			if c < utf8.RuneSelf {
-				b.WriteByte(c)
 				i++
 				continue
 			}
 			r, size := utf8.DecodeRuneInString(s[i:])
-			b.WriteRune(r)
+			if r == utf8.RuneError && size == 1 {
+				// Invalid UTF-8 (Go strings can hold it; Python's can't): as U+FFFD.
+				b.WriteString(s[start:i])
+				b.WriteRune(utf8.RuneError)
+				i++
+				start = i
+				continue
+			}
 			i += size
 			continue
 		}
+		b.WriteString(s[start:i])
 		switch c {
 		case '"':
 			b.WriteString(`\"`)
@@ -204,10 +230,15 @@ func writeString(b *bytes.Buffer, s string) {
 		case '\f':
 			b.WriteString(`\f`)
 		default:
-			fmt.Fprintf(b, `\u%04x`, c)
+			const hex = "0123456789abcdef"
+			b.WriteString(`\u00`)
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0xf])
 		}
 		i++
+		start = i
 	}
+	b.WriteString(s[start:])
 	b.WriteByte('"')
 }
 

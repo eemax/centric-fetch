@@ -1,8 +1,9 @@
 // Package store is the SQLite database: raw Centric records (bronze_records) and fetch
 // bookkeeping (meta_*).
 //
-// The layout is schema version 1. Readers depend on it: add tables or indexes, never change
-// existing columns.
+// The layout is schema version 1. Readers depend on it: add tables, columns or indexes, never
+// change existing ones. Columns added after the first release are created on open (migrate)
+// and may be missing from a database no fetch has opened since; readers check (Columns).
 package store
 
 import (
@@ -92,6 +93,17 @@ CREATE TABLE IF NOT EXISTS bronze_records (
     change_seq INTEGER NOT NULL,
     PRIMARY KEY (endpoint, id)
 );
+CREATE TABLE IF NOT EXISTS meta_windows (
+    endpoint TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    pass INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    delta_floor TEXT,
+    next_skip INTEGER NOT NULL,
+    fetched INTEGER NOT NULL,
+    PRIMARY KEY (endpoint, mode)
+);
 CREATE INDEX IF NOT EXISTS bronze_records_seen ON bronze_records (endpoint, last_seen_run);
 CREATE INDEX IF NOT EXISTS bronze_records_changes ON bronze_records (endpoint, change_seq);
 `
@@ -99,6 +111,70 @@ CREATE INDEX IF NOT EXISTS bronze_records_changes ON bronze_records (endpoint, c
 // Counting active/deleted records per endpoint from this index never touches the payloads
 // (in the table they'd be read just to get past them to the deleted column).
 const liveIndex = `CREATE INDEX IF NOT EXISTS bronze_records_live ON bronze_records (endpoint, deleted)`
+
+// Columns added since the first release, created by migrate.
+var addedColumns = []struct{ table, column, def string }{
+	{"meta_endpoint_state", "last_incremental_success_at", "TEXT"},
+	{"meta_run_endpoints", "silent", "INTEGER NOT NULL DEFAULT 0"},
+	{"meta_run_endpoints", "silent_fields", "TEXT"},
+}
+
+// migrate brings an existing database up to date. It's idempotent.
+//
+// Unfinished windows used to live in meta_endpoint_state's pending_* columns, one per
+// endpoint; now each endpoint has one per mode in meta_windows. The old columns stay (they
+// can't be dropped without breaking readers) but are no longer written, so a window found
+// there was written by an older version run since (a rollback) and is the newer one.
+func migrate(tx *sql.Tx) error {
+	for _, c := range addedColumns {
+		cols, err := columns(tx, c.table)
+		if err != nil {
+			return err
+		}
+		if !cols[c.column] {
+			if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.column, c.def)); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO meta_windows (endpoint, mode, run_id, pass, started_at,
+		delta_floor, next_skip, fetched)
+		SELECT endpoint, pending_mode, pending_run_id, COALESCE(pending_pass, 1), pending_started_at,
+		       pending_delta_floor, COALESCE(pending_next_skip, 0), COALESCE(pending_fetched, 0)
+		FROM meta_endpoint_state
+		WHERE pending_run_id IS NOT NULL AND pending_mode IN ('delta', 'full') AND pending_started_at IS NOT NULL`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`UPDATE meta_endpoint_state SET pending_run_id = NULL, pending_mode = NULL,
+		pending_pass = NULL, pending_started_at = NULL, pending_delta_floor = NULL, pending_next_skip = NULL,
+		pending_fetched = NULL WHERE pending_run_id IS NOT NULL`)
+	return err
+}
+
+type querier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func columns(q querier, table string) (map[string]bool, error) {
+	rows, err := q.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
+}
+
+// Columns lists a table's columns (none if the table doesn't exist), for readers of databases
+// that may predate a column.
+func (db *DB) Columns(table string) (map[string]bool, error) { return columns(db, table) }
 
 // DB is an open database. Writers hold it alone (one connection, see Lock).
 type DB struct {
@@ -129,6 +205,9 @@ func Open(path string) (*DB, error) {
 	}
 	err = db.Tx(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(schema + liveIndex); err != nil {
+			return err
+		}
+		if err := migrate(tx); err != nil {
 			return err
 		}
 		_, err := tx.Exec(`INSERT INTO meta_info (key, value) VALUES ('schema_version', ?), ('change_seq', '0')
@@ -295,6 +374,26 @@ func AcquireLock(dbPath string) (*Lock, error) {
 	f.Truncate(0)
 	fmt.Fprintf(f, "%d\n", os.Getpid())
 	return &Lock{f}, nil
+}
+
+// AcquireLockWait takes the writer lock, waiting up to wait for another fetch to finish. It
+// returns ErrLocked when the wait runs out, and the context's error when it's cancelled.
+func AcquireLockWait(ctx context.Context, dbPath string, wait time.Duration) (*Lock, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		l, err := AcquireLock(dbPath)
+		left := time.Until(deadline)
+		if !errors.Is(err, ErrLocked) || left <= 0 {
+			return l, err
+		}
+		t := time.NewTimer(min(time.Second, left))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, context.Cause(ctx)
+		case <-t.C:
+		}
+	}
 }
 
 // Release drops the lock.

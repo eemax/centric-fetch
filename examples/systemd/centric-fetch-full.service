@@ -3,12 +3,12 @@ Description=centric-fetch: full fetch from Centric PLM (flags deletions), then d
 Documentation=https://github.com/eemax/centric-fetch
 After=network-online.target
 Wants=network-online.target
-# No Conflicts= with the incremental unit: that would stop a running fetch. The lock refuses
-# a second concurrent one instead (exit 2).
+# No Conflicts= with the incremental unit: that would stop a running fetch. If one is running,
+# this waits for it (--wait) rather than skip the week's full fetch.
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/centric-fetch fetch --config /etc/centric-fetch/config.json --full --maintain
+ExecStart=/usr/local/bin/centric-fetch fetch --config /etc/centric-fetch/config.json --full --maintain --wait 1h
 TimeoutStartSec=4h
 TimeoutStopSec=60
 Nice=10

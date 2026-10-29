@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -13,11 +14,14 @@ import (
 
 func (e *env) state(endpoint string) (cursor, pendingRun sql.NullString, skip sql.NullInt64, attempt sql.NullString) {
 	e.t.Helper()
-	err := e.db.QueryRow(`SELECT last_success_started_at, pending_run_id, pending_next_skip, last_attempt_status
-		FROM meta_endpoint_state WHERE endpoint = ?`, endpoint).Scan(&cursor, &pendingRun, &skip, &attempt)
+	err := e.db.QueryRow(`SELECT last_success_started_at, last_attempt_status
+		FROM meta_endpoint_state WHERE endpoint = ?`, endpoint).Scan(&cursor, &attempt)
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	// The window the next incremental run would resume: a full one first.
+	e.db.QueryRow(`SELECT run_id, next_skip FROM meta_windows WHERE endpoint = ?
+		ORDER BY mode = 'full' DESC LIMIT 1`, endpoint).Scan(&pendingRun, &skip)
 	return
 }
 
@@ -345,5 +349,134 @@ func TestPhantomCountIsANoteOnFullFetches(t *testing.T) {
 	}
 	if now, _, _, _ := e.state("styles"); now.String != store.Iso(e.now) {
 		t.Fatalf("cursor %v, want %s", now, store.Iso(e.now))
+	}
+}
+
+func TestSilentChangesAreCounted(t *testing.T) {
+	e := newEnv(t)
+	e.fake.add("styles", styles(3, t0)...)
+	e.run(Options{})
+
+	// S000 changes without _modified_at moving, S001 changes the normal way.
+	silent := styles(3, t0)[0]
+	silent.Name = "renamed quietly"
+	e.fake.add("styles", silent, record{ID: "S001", Modified: t0.Add(time.Hour), Name: "renamed"})
+	e.now = e.now.Add(time.Hour)
+	sum := e.run(Options{Full: true})
+	o := sum.endpoint("styles")
+	if o.Updated != 2 || o.Silent != 1 || o.SilentFields["node_name"] != 1 || len(o.SilentFields) != 1 || sum.Totals.Silent != 1 {
+		t.Fatalf("silent: %+v totals %+v", o, sum.Totals)
+	}
+	var stored int
+	var fields string
+	e.db.QueryRow(`SELECT silent, silent_fields FROM meta_run_endpoints WHERE run_id = ? AND endpoint = 'styles'`, sum.RunID).Scan(&stored, &fields)
+	if stored != 1 || fields != `{"node_name":1}` {
+		t.Fatalf("recorded silent %d fields %s", stored, fields)
+	}
+}
+
+func TestWindowsAreKeptPerMode(t *testing.T) {
+	e := newEnv(t)
+	e.fake.add("styles", styles(5, t0)...)
+	e.run(Options{})
+	only := Options{Endpoints: []string{"styles"}}
+	windows := func() map[string]int64 {
+		out := map[string]int64{}
+		rows, _ := e.db.Query(`SELECT mode, next_skip FROM meta_windows WHERE endpoint = 'styles'`)
+		defer rows.Close()
+		for rows.Next() {
+			var mode string
+			var skip int64
+			rows.Scan(&mode, &skip)
+			out[mode] = skip
+		}
+		return out
+	}
+
+	change := func() {
+		e.now = e.now.Add(time.Hour)
+		for i := range 3 {
+			e.fake.add("styles", record{ID: fmt.Sprintf("S00%d", i), Modified: e.now.Add(-30 * time.Minute), Name: e.now.String()})
+		}
+	}
+	// An incremental window stops half-way, then a full one: each keeps its own.
+	change()
+	e.fake.failFrom = e.fake.pages + 2
+	if o := e.run(only).endpoint("styles"); o.Status != "failed" || o.Mode != "delta" {
+		t.Fatalf("interrupted delta: %+v", o)
+	}
+	if w := windows(); len(w) != 1 || w["delta"] != 2 {
+		t.Fatalf("after the interrupted delta: %v", w)
+	}
+	e.fake.failFrom = e.fake.pages + 2
+	e.run(Options{Endpoints: []string{"styles"}, Full: true})
+	if w := windows(); len(w) != 2 || w["delta"] != 2 || w["full"] != 2 {
+		t.Fatalf("after the interrupted full: %v", w)
+	}
+
+	// The next incremental run resumes the full window: it covers more. A resumed full window
+	// can't be proven, so the cursor stays; finishing it ends the incremental window too, and
+	// the run after that opens a fresh one from the same floor, with no false duplicates or
+	// late finds from the records the full re-stamped.
+	e.fake.failFrom = 0
+	o := e.run(only).endpoint("styles")
+	if o.Mode != "full" || !o.Resumed || o.Status != "ok" || o.Complete {
+		t.Fatalf("resumed full: %+v", o)
+	}
+	if w := windows(); len(w) != 0 {
+		t.Fatalf("after the resumed full: %v", w)
+	}
+	o = e.run(only).endpoint("styles")
+	if o.Mode != "delta" || o.Resumed || !o.Complete || o.Passes != 1 || len(o.Notes) != 0 {
+		t.Fatalf("fresh delta: %+v", o)
+	}
+
+	// An integrity error drops only its own mode's window.
+	change()
+	e.fake.failFrom = e.fake.pages + 2
+	e.run(only)
+	e.fake.failFrom, e.fake.ignoreSkip = 0, true
+	if o := e.run(Options{Endpoints: []string{"styles"}, Full: true}).endpoint("styles"); o.Status != "failed" {
+		t.Fatalf("integrity: %+v", o)
+	}
+	e.fake.ignoreSkip = false
+	if w := windows(); len(w) != 1 || w["delta"] != 2 {
+		t.Fatalf("after the integrity error: %v", w)
+	}
+	e.run(only)
+
+	// --restart drops every unfinished window.
+	e.fake.failFrom = e.fake.pages + 2
+	e.run(Options{Endpoints: []string{"styles"}, Full: true})
+	e.fake.failFrom = 0
+	if o := e.run(Options{Endpoints: []string{"styles"}, Restart: true}).endpoint("styles"); o.Mode != "delta" || o.Resumed {
+		t.Fatalf("restart: %+v", o)
+	}
+	if w := windows(); len(w) != 0 {
+		t.Fatalf("after restart: %v", w)
+	}
+	var full, incremental sql.NullString
+	e.db.QueryRow(`SELECT last_full_success_at, last_incremental_success_at FROM meta_endpoint_state WHERE endpoint = 'styles'`).Scan(&full, &incremental)
+	if !full.Valid || !incremental.Valid {
+		t.Fatalf("last successes: full %v incremental %v", full, incremental)
+	}
+}
+
+// With --restart, the in-run retry still resumes where the first try stopped.
+func TestRestartKeepsTheFirstTryForTheRetry(t *testing.T) {
+	e := newEnv(t)
+	e.cfg.EndpointRetryAfter = time.Millisecond
+	e.fake.add("styles", styles(6, t0)...)
+	failed := false
+	e.fake.pageHook = func(_ string, skip int) { // after the third page, the next request fails 3 times
+		e.fake.mu.Lock()
+		if skip == 4 && !failed {
+			e.fake.statuses, failed = []int{500, 500, 500}, true
+		}
+		e.fake.mu.Unlock()
+	}
+	o := e.run(Options{Endpoints: []string{"styles"}, Restart: true}).endpoint("styles")
+	if o.Status != "ok" || o.Attempts != 2 || !o.Resumed || o.Inserted != 6 {
+		t.Fatalf("%+v", o)
 	}
 }

@@ -1,6 +1,7 @@
 # Design: scoped fetches
 
-Status: **design, not implemented**. Nothing here changes how centric-fetch behaves today.
+Status: **milestone 1 implemented** (silent changes, windows per mode, `--wait` and exit 75,
+`check --max-full-age`); scopes themselves (milestones 2–4) are design only.
 
 ## Why
 
@@ -204,9 +205,15 @@ re-read of the lines of revisions that changed, not a scope.
 ### Windows and the lock
 
 - Each endpoint keeps one unfinished window **per kind** (incremental, scoped, full) instead of
-  one in all, so an hourly incremental fetch doesn't take over a half-read scoped or full
-  window. An unfinished full window still serves the other two (it covers more); an unfinished
-  scoped window serves only a scoped fetch.
+  one in all (done in milestone 1). Today an unfinished full window also serves an incremental
+  fetch, because it covers more. With hourly fetches that would stall freshness: a resumed full
+  window can't be proven, so it never moves the cursor, and a large one could take several
+  runs. Milestone 2 therefore lets each kind read only its own window, which needs one more
+  change first: records are stamped with the run that last saw them (`last_seen_run`), and
+  that stamp is shared, so a window read in between hides records from a full window's
+  deletion check (they'd be looked up by id, safely, but needlessly) and confuses a resumed
+  window's proof. The stamp has to become per kind (a column per kind, or a seen table per
+  open window) before kinds can interleave freely.
 - `fetch --wait <duration>` waits for the lock instead of giving up, so an hourly fetch that
   starts during a nightly one runs straight after it. When the wait runs out (or without
   `--wait`), the fetch exits **75** ("busy", sysexits' `EX_TEMPFAIL`) with a summary of status
@@ -215,8 +222,8 @@ re-read of the lines of revisions that changed, not a scope.
 
 ## Visibility
 
-- **Silent changes**, in every fetch that isn't incremental: records whose payload changed while
-  `_modified_at` didn't. The outcome gets `silent` (a count) and `silent_fields` (the
+- **Silent changes**, in every fetch: records whose payload changed while `_modified_at`
+  didn't (in practice found by full and scoped fetches, which re-read unchanged records). The outcome gets `silent` (a count) and `silent_fields` (the
   top-level fields that changed most, with counts). This is what tells a company which
   endpoints need a scope, and it's useful on its own as a data-quality signal.
 - **`centric-fetch plan [--scoped|--full] [-e name] [--json]`** makes no changes and takes no
@@ -226,8 +233,8 @@ re-read of the lines of revisions that changed, not a scope.
   compares Centric's count with the number of stored records that match locally, and warns on
   a large gap (for example a `field=!a&field=!b` that Centric reads as "or").
 - **`status`** shows, per endpoint, the last incremental, scoped and full success. **`check`**
-  takes an age per kind: `--max-age 2h --max-scoped-age 26h --max-full-age 15d` (the last two
-  only when set).
+  takes an age per kind: `--max-age 2h --max-scoped-age 26h --max-full-age 15d` (each only
+  when given; `--max-scoped-age` comes with milestone 2).
 
 ## Compatibility
 
@@ -241,10 +248,11 @@ re-read of the lines of revisions that changed, not a scope.
 
 ## Milestones
 
-1. **Groundwork.** Silent-change tracking; per-kind windows and last successes; `--wait` and
-   exit 75; `check` ages per kind. Useful without scopes, and the silent-change numbers decide
-   the scopes.
-2. **Scopes with literal conditions.** `scopes` with `where` of literals and operators,
+1. **Groundwork** (done, v0.2.0). Silent-change tracking; per-kind windows and last
+   successes; `--wait` and exit 75; `check --max-full-age`. Useful without scopes, and the silent-change
+   numbers decide the scopes.
+2. **Scopes with literal conditions.** Seen stamps per kind, then each kind resuming only its
+   own window (see "Windows and the lock"). `scopes` with `where` of literals and operators,
    `"all"`, `fetch --scoped`, `plan`. Covers `is_current` and `active`.
 3. **Sets.** Local set evaluation, `in`/`not_in` resolution, byte-budget batching, the
    cost-based planner, dependency order, `max_set_age`, the count check in `plan`.

@@ -41,8 +41,9 @@ Run 'centric-fetch <command> -h' for its flags.
 // Exit codes.
 const (
 	exitOK     = 0
-	exitFailed = 1 // the run failed or was partial; check: unhealthy
-	exitUsage  = 2 // bad flags or config, or another fetch holds the lock
+	exitFailed = 1  // the run failed or was partial; check: unhealthy
+	exitUsage  = 2  // bad flags, config or credentials
+	exitBusy   = 75 // another fetch holds the lock (sysexits' EX_TEMPFAIL): skipped, try later
 	exitSignal = 128
 )
 
@@ -94,6 +95,7 @@ func cmdFetch(args []string, stdout, stderr io.Writer) int {
 	massDelete := fs.Bool("allow-mass-delete", false, "with --full: flag deletions even when more than 10% of an endpoint is gone")
 	maintain := fs.Bool("maintain", false, "after the fetch: integrity check, VACUUM, optimize, WAL checkpoint")
 	verbose := fs.Bool("v", false, "progress on stderr")
+	waitFor := fs.String("wait", "", "when another fetch holds the lock, wait up to this long for it (e.g. 30m) instead of skipping")
 	var endpoints endpointList
 	fs.Var(&endpoints, "e", "only this endpoint (repeat, or comma-separated)")
 	if fs.Parse(args) != nil {
@@ -102,6 +104,13 @@ func cmdFetch(args []string, stdout, stderr io.Writer) int {
 	if *massDelete && !*full {
 		fmt.Fprintln(stderr, "centric-fetch: --allow-mass-delete only applies to --full")
 		return exitUsage
+	}
+	var wait time.Duration
+	if *waitFor != "" {
+		var err error
+		if wait, err = status.ParseDuration(*waitFor); err != nil {
+			return fail(stderr, exitUsage, fmt.Errorf("--wait %q: %w", *waitFor, err))
+		}
 	}
 	cfg, err := config.Load(config.Resolve(*configPath))
 	if err != nil {
@@ -114,19 +123,6 @@ func cmdFetch(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, exitUsage, err)
 	}
-
-	lock, err := store.AcquireLock(cfg.Database)
-	if errors.Is(err, store.ErrLocked) {
-		return fail(stderr, exitUsage, fmt.Errorf("%w (%s.lock)", err, cfg.Database))
-	} else if err != nil {
-		return fail(stderr, exitFailed, err)
-	}
-	defer lock.Release()
-	db, err := store.Open(cfg.Database)
-	if err != nil {
-		return fail(stderr, exitFailed, err)
-	}
-	defer db.Close()
 
 	// SIGTERM (systemd stop), SIGINT, SIGHUP: stop requesting, keep what's stored, exit
 	// 128+signal. The next run resumes where this one stopped.
@@ -141,6 +137,38 @@ func cmdFetch(args []string, stdout, stderr io.Writer) int {
 		signal.Reset(syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 		cancel(fmt.Errorf("%s", strings.ToUpper(signalName(caught))))
 	}()
+	signalExit := func() int {
+		if s, ok := caught.(syscall.Signal); ok {
+			return exitSignal + int(s)
+		}
+		return exitSignal + int(syscall.SIGTERM)
+	}
+
+	began := time.Now()
+	lock, err := store.AcquireLockWait(ctx, cfg.Database, wait)
+	if errors.Is(err, store.ErrLocked) || (err != nil && ctx.Err() != nil) {
+		msg := fmt.Sprintf("%v (%s.lock)", store.ErrLocked, cfg.Database)
+		if wait > 0 {
+			msg += "; waited " + *waitFor
+		}
+		if ctx.Err() != nil {
+			msg = "stopped while waiting for the lock: " + context.Cause(ctx).Error()
+		}
+		printSkipped(stdout, *full, began, msg)
+		fmt.Fprintln(stderr, "centric-fetch:", msg)
+		if ctx.Err() != nil {
+			return signalExit()
+		}
+		return exitBusy
+	} else if err != nil {
+		return fail(stderr, exitFailed, err)
+	}
+	defer lock.Release()
+	db, err := store.Open(cfg.Database)
+	if err != nil {
+		return fail(stderr, exitFailed, err)
+	}
+	defer db.Close()
 
 	logf := func(string, ...any) {}
 	if *verbose {
@@ -173,15 +201,30 @@ func cmdFetch(args []string, stdout, stderr io.Writer) int {
 	line, _ := json.Marshal(out)
 	fmt.Fprintln(stdout, string(line))
 	if errors.Is(err, fetch.ErrStopped) {
-		if s, ok := caught.(syscall.Signal); ok {
-			return exitSignal + int(s)
-		}
-		return exitSignal + int(syscall.SIGTERM)
+		return signalExit()
 	}
 	if sum.Status == "failed" || sum.Status == "partial" {
 		return exitFailed
 	}
 	return exitOK
+}
+
+// printSkipped prints the summary of a fetch that didn't run because the lock was held: the
+// usual shape, with nothing fetched.
+func printSkipped(stdout io.Writer, full bool, began time.Time, msg string) {
+	sum := &fetch.Summary{Status: "skipped", Mode: "incremental", StartedAt: store.Iso(began), Error: msg,
+		Endpoints: []*fetch.Outcome{}}
+	if full {
+		sum.Mode = "full"
+	}
+	now := time.Now()
+	sum.FinishedAt = store.Iso(now)
+	sum.Seconds = float64(now.Sub(began).Milliseconds()/100) / 10
+	line, _ := json.Marshal(struct {
+		Event string `json:"event"`
+		*fetch.Summary
+	}{"run", sum})
+	fmt.Fprintln(stdout, string(line))
 }
 
 func cmdStatus(args []string, stdout, stderr io.Writer) int {
@@ -218,7 +261,7 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "          error: %s\n", *r.Error)
 		}
 	}
-	fmt.Fprintf(stdout, "\n%-16s %9s %8s  %-24s %s\n", "endpoint", "records", "deleted", "last success", "last attempt")
+	fmt.Fprintf(stdout, "\n%-16s %9s %8s  %-24s %-24s %s\n", "endpoint", "records", "deleted", "last success", "last full", "last attempt")
 	for _, e := range st.Endpoints {
 		attempt := deref(e.LastAttemptStatus)
 		if e.PendingResume {
@@ -227,7 +270,8 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 		if e.LastAttemptError != nil {
 			attempt += ": " + *e.LastAttemptError
 		}
-		fmt.Fprintf(stdout, "%-16s %9d %8d  %-24s %s\n", e.Endpoint, e.ActiveRecords, e.DeletedRecords, deref(e.LastSuccessAt), attempt)
+		fmt.Fprintf(stdout, "%-16s %9d %8d  %-24s %-24s %s\n", e.Endpoint, e.ActiveRecords, e.DeletedRecords,
+			deref(e.LastSuccessAt), deref(e.LastFullSuccessAt), attempt)
 	}
 	return exitOK
 }
@@ -237,22 +281,29 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "config file")
 	maxAge := fs.String("max-age", "", "also require each endpoint's last success to be this recent (e.g. 26h)")
+	maxFullAge := fs.String("max-full-age", "", "also require each endpoint's last full success to be this recent (e.g. 15d)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if fs.Parse(args) != nil {
 		return exitUsage
 	}
-	var age time.Duration
-	if *maxAge != "" {
+	var ages status.Ages
+	for _, a := range []struct {
+		flag, value string
+		into        *time.Duration
+	}{{"--max-age", *maxAge, &ages.Any}, {"--max-full-age", *maxFullAge, &ages.Full}} {
+		if a.value == "" {
+			continue
+		}
 		var err error
-		if age, err = status.ParseDuration(*maxAge); err != nil {
-			return fail(stderr, exitUsage, fmt.Errorf("--max-age %q: %w", *maxAge, err))
+		if *a.into, err = status.ParseDuration(a.value); err != nil {
+			return fail(stderr, exitUsage, fmt.Errorf("%s %q: %w", a.flag, a.value, err))
 		}
 	}
 	cfg, err := config.Load(config.Resolve(*configPath))
 	if err != nil {
 		return fail(stderr, exitUsage, err)
 	}
-	h, err := status.Check(cfg, age, time.Now())
+	h, err := status.Check(cfg, ages, time.Now())
 	if err != nil {
 		return fail(stderr, exitFailed, err)
 	}

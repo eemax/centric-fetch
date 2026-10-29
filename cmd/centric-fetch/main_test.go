@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/eemax/centric-fetch/internal/store"
 )
 
 func cli(t *testing.T, args ...string) (int, string, string) {
@@ -54,5 +56,38 @@ func TestCheckAndStatusWithoutDatabase(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "centric.db")); err == nil {
 		t.Fatal("database created without credentials")
+	}
+}
+
+func TestHeldLockSkipsWithExit75(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	os.WriteFile(cfg, []byte(`{"database": "centric.db", "endpoints": ["styles"]}`), 0o600)
+	t.Setenv("CENTRIC_BASE_URL", "http://127.0.0.1:1")
+	t.Setenv("CENTRIC_USERNAME", "u")
+	t.Setenv("CENTRIC_PASSWORD", "p")
+	lock, err := store.AcquireLock(filepath.Join(dir, "centric.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+
+	for _, args := range [][]string{{}, {"--wait", "1", "--full"}} {
+		code, out, _ := cli(t, append([]string{"fetch", "--config", cfg}, args...)...)
+		var sum struct {
+			Event, Status, Mode, Error string
+			Totals                     map[string]int
+			Endpoints                  []any
+		}
+		if code != exitBusy || json.Unmarshal([]byte(out), &sum) != nil || sum.Event != "run" || sum.Status != "skipped" ||
+			!strings.Contains(sum.Error, "holds the lock") || sum.Totals["fetched"] != 0 || sum.Endpoints == nil {
+			t.Fatalf("%v: %d %s", args, code, out)
+		}
+		if len(args) > 0 && (sum.Mode != "full" || !strings.Contains(sum.Error, "waited 1")) {
+			t.Fatalf("with --wait: %s", out)
+		}
+	}
+	if code, _, _ := cli(t, "fetch", "--config", cfg, "--wait", "soon"); code != exitUsage {
+		t.Fatalf("bad --wait: %d", code)
 	}
 }

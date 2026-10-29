@@ -33,9 +33,11 @@ type Endpoint struct {
 	IncrementalCursor *string `json:"incremental_cursor"`
 	LastSuccessMode   *string `json:"last_success_mode"`
 	LastFullSuccessAt *string `json:"last_full_success_at"`
-	LastAttemptStatus *string `json:"last_attempt_status"`
-	LastAttemptError  *string `json:"last_attempt_error"`
-	PendingResume     bool    `json:"pending_resume"`
+	// Unknown (null) until a fetch of this version has run.
+	LastIncrementalSuccessAt *string `json:"last_incremental_success_at"`
+	LastAttemptStatus        *string `json:"last_attempt_status"`
+	LastAttemptError         *string `json:"last_attempt_error"`
+	PendingResume            bool    `json:"pending_resume"`
 }
 
 // Run is a recorded run with what it did per endpoint and in total.
@@ -64,6 +66,7 @@ type RunEndpoint struct {
 	Restored  int      `json:"restored"`
 	Deleted   int      `json:"deleted"`
 	Missing   int      `json:"missing"`
+	Silent    int      `json:"silent"`
 	Expected  *int     `json:"expected"`
 	Complete  bool     `json:"complete"`
 	Warning   *string  `json:"warning"`
@@ -71,7 +74,43 @@ type RunEndpoint struct {
 	Seconds   *float64 `json:"seconds"`
 }
 
-var runCounts = []string{"fetched", "inserted", "updated", "unchanged", "restored", "deleted", "missing"}
+var runCounts = []string{"fetched", "inserted", "updated", "unchanged", "restored", "deleted", "missing", "silent"}
+
+// schema is what a database that may predate some columns has.
+type schema struct {
+	state, runEndpoints map[string]bool
+	windows             bool
+}
+
+func readSchema(db *store.DB) (schema, error) {
+	var sc schema
+	var err error
+	if sc.state, err = db.Columns("meta_endpoint_state"); err != nil {
+		return sc, err
+	}
+	if sc.runEndpoints, err = db.Columns("meta_run_endpoints"); err != nil {
+		return sc, err
+	}
+	w, err := db.Columns("meta_windows")
+	sc.windows = len(w) > 0
+	return sc, err
+}
+
+// colOr is the column if it exists, else the fallback expression.
+func colOr(cols map[string]bool, column, fallback string) string {
+	if cols[column] {
+		return column
+	}
+	return fallback
+}
+
+// pending is the expression telling whether an endpoint has an unfinished window.
+func (sc schema) pending() string {
+	if sc.windows {
+		return "EXISTS (SELECT 1 FROM meta_windows w WHERE w.endpoint = meta_endpoint_state.endpoint)"
+	}
+	return "pending_run_id IS NOT NULL"
+}
 
 // Collect reads the status.
 func Collect(cfg *config.Config) (*Status, error) {
@@ -90,6 +129,10 @@ func Collect(cfg *config.Config) (*Status, error) {
 	}
 	defer db.Close()
 
+	sc, err := readSchema(db)
+	if err != nil {
+		return nil, err
+	}
 	type counts struct{ active, deleted int }
 	byEndpoint := map[string]*counts{}
 	rows, err := db.Query(`SELECT endpoint, deleted, COUNT(*) FROM bronze_records GROUP BY endpoint, deleted`)
@@ -122,25 +165,24 @@ func Collect(cfg *config.Config) (*Status, error) {
 		if c := byEndpoint[ep.Name]; c != nil {
 			e.ActiveRecords, e.DeletedRecords = c.active, c.deleted
 		}
-		var pending sql.NullString
 		err := db.QueryRow(`SELECT last_success_finished_at, last_success_started_at, last_success_mode,
-			last_full_success_at, last_attempt_status, last_attempt_error, pending_run_id
+			last_full_success_at, `+colOr(sc.state, "last_incremental_success_at", "NULL")+`,
+			last_attempt_status, last_attempt_error, `+sc.pending()+`
 			FROM meta_endpoint_state WHERE endpoint = ?`, ep.Name).Scan(
 			&e.LastSuccessAt, &e.IncrementalCursor, &e.LastSuccessMode, &e.LastFullSuccessAt,
-			&e.LastAttemptStatus, &e.LastAttemptError, &pending)
+			&e.LastIncrementalSuccessAt, &e.LastAttemptStatus, &e.LastAttemptError, &e.PendingResume)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
 		}
-		e.PendingResume = pending.Valid
 		st.Endpoints = append(st.Endpoints, e)
 	}
-	if st.LastRun, err = lastRun(db, ""); err != nil {
+	if st.LastRun, err = lastRun(db, sc, ""); err != nil {
 		return nil, err
 	}
 	return st, nil
 }
 
-func lastRun(db *store.DB, filter string) (*Run, error) {
+func lastRun(db *store.DB, sc schema, filter string) (*Run, error) {
 	r := &Run{}
 	err := db.QueryRow(`SELECT run_id, command, started_at, finished_at, status, error FROM meta_runs `+filter+
 		` ORDER BY started_at DESC LIMIT 1`).Scan(&r.RunID, &r.Command, &r.StartedAt, &r.FinishedAt, &r.Status, &r.Error)
@@ -152,7 +194,7 @@ func lastRun(db *store.DB, filter string) (*Run, error) {
 	}
 	r.DurationSeconds = secondsBetween(&r.StartedAt, r.FinishedAt)
 	rows, err := db.Query(`SELECT endpoint, mode, status, fetched, inserted, updated, unchanged, restored,
-		deleted, missing, expected, complete, warning, error, started_at, finished_at
+		deleted, missing, `+colOr(sc.runEndpoints, "silent", "0")+`, expected, complete, warning, error, started_at, finished_at
 		FROM meta_run_endpoints WHERE run_id = ? ORDER BY started_at, endpoint`, r.RunID)
 	if err != nil {
 		return nil, err
@@ -169,12 +211,12 @@ func lastRun(db *store.DB, filter string) (*Run, error) {
 		var started string
 		var finished *string
 		if err := rows.Scan(&e.Endpoint, &e.Mode, &e.Status, &e.Fetched, &e.Inserted, &e.Updated, &e.Unchanged,
-			&e.Restored, &e.Deleted, &e.Missing, &e.Expected, &e.Complete, &e.Warning, &e.Error, &started, &finished); err != nil {
+			&e.Restored, &e.Deleted, &e.Missing, &e.Silent, &e.Expected, &e.Complete, &e.Warning, &e.Error, &started, &finished); err != nil {
 			return nil, err
 		}
 		e.Seconds = secondsBetween(&started, finished)
 		for k, v := range map[string]int{"fetched": e.Fetched, "inserted": e.Inserted, "updated": e.Updated,
-			"unchanged": e.Unchanged, "restored": e.Restored, "deleted": e.Deleted, "missing": e.Missing} {
+			"unchanged": e.Unchanged, "restored": e.Restored, "deleted": e.Deleted, "missing": e.Missing, "silent": e.Silent} {
 			r.Totals[k] += v
 		}
 		modes[e.Mode] = true
@@ -195,13 +237,14 @@ func lastRun(db *store.DB, filter string) (*Run, error) {
 
 // Health is `centric-fetch check`.
 type Health struct {
-	Healthy       bool           `json:"healthy"`
-	CheckedAt     string         `json:"checked_at"`
-	MaxAgeSeconds *int64         `json:"max_age_seconds"`
-	Problems      []string       `json:"problems"`
-	LastFetch     *Run           `json:"last_fetch"`
-	Running       bool           `json:"running"`
-	Endpoints     []HealthDetail `json:"endpoints"`
+	Healthy           bool           `json:"healthy"`
+	CheckedAt         string         `json:"checked_at"`
+	MaxAgeSeconds     *int64         `json:"max_age_seconds"`
+	MaxFullAgeSeconds *int64         `json:"max_full_age_seconds"`
+	Problems          []string       `json:"problems"`
+	LastFetch         *Run           `json:"last_fetch"`
+	Running           bool           `json:"running"`
+	Endpoints         []HealthDetail `json:"endpoints"`
 }
 
 // HealthDetail is one endpoint's health.
@@ -210,19 +253,32 @@ type HealthDetail struct {
 	Healthy           bool     `json:"healthy"`
 	LastSuccessAt     *string  `json:"last_success_at"`
 	AgeSeconds        *int64   `json:"age_seconds"`
+	LastFullSuccessAt *string  `json:"last_full_success_at"`
+	FullAgeSeconds    *int64   `json:"full_age_seconds"`
 	LastAttemptStatus *string  `json:"last_attempt_status"`
 	Problems          []string `json:"problems"`
 }
 
+// Ages are the limits Check enforces; zero means no limit.
+type Ages struct {
+	Any  time.Duration // since an endpoint's last success of any kind
+	Full time.Duration // since its last full success
+}
+
 // Check says whether the data is fresh and the last fetch good: the database exists, the
 // latest fetch didn't fail (one in progress is fine), and every endpoint has a success, its
-// last attempt didn't fail and, with maxAge, that success is recent enough.
-func Check(cfg *config.Config, maxAge time.Duration, now time.Time) (*Health, error) {
+// last attempt didn't fail and that success (and, with ages.Full, its last full one) is
+// recent enough.
+func Check(cfg *config.Config, ages Ages, now time.Time) (*Health, error) {
 	h := &Health{CheckedAt: store.Iso(now), Problems: []string{}, Endpoints: []HealthDetail{}, Running: store.Locked(cfg.Database)}
-	if maxAge > 0 {
-		s := int64(maxAge.Seconds())
-		h.MaxAgeSeconds = &s
+	seconds := func(d time.Duration) *int64 {
+		if d <= 0 {
+			return nil
+		}
+		s := int64(d.Seconds())
+		return &s
 	}
+	h.MaxAgeSeconds, h.MaxFullAgeSeconds = seconds(ages.Any), seconds(ages.Full)
 	if _, err := os.Stat(cfg.Database); err != nil {
 		h.Problems = append(h.Problems, "database not created yet: "+cfg.Database)
 		return h, nil
@@ -232,7 +288,11 @@ func Check(cfg *config.Config, maxAge time.Duration, now time.Time) (*Health, er
 		return nil, err
 	}
 	defer db.Close()
-	if h.LastFetch, err = lastRun(db, "WHERE command LIKE 'fetch%'"); err != nil {
+	sc, err := readSchema(db)
+	if err != nil {
+		return nil, err
+	}
+	if h.LastFetch, err = lastRun(db, sc, "WHERE command LIKE 'fetch%'"); err != nil {
 		return nil, err
 	}
 	switch lf := h.LastFetch; {
@@ -252,8 +312,9 @@ func Check(cfg *config.Config, maxAge time.Duration, now time.Time) (*Health, er
 	for _, ep := range cfg.Endpoints {
 		d := HealthDetail{Endpoint: ep.Name, Problems: []string{}}
 		var lastError *string
-		err := db.QueryRow(`SELECT last_success_finished_at, last_attempt_status, last_attempt_error
-			FROM meta_endpoint_state WHERE endpoint = ?`, ep.Name).Scan(&d.LastSuccessAt, &d.LastAttemptStatus, &lastError)
+		err := db.QueryRow(`SELECT last_success_finished_at, last_full_success_at, last_attempt_status, last_attempt_error
+			FROM meta_endpoint_state WHERE endpoint = ?`, ep.Name).Scan(&d.LastSuccessAt, &d.LastFullSuccessAt,
+			&d.LastAttemptStatus, &lastError)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
 		}
@@ -262,9 +323,20 @@ func Check(cfg *config.Config, maxAge time.Duration, now time.Time) (*Health, er
 		} else if t, ok := store.ParseTime(*d.LastSuccessAt); ok {
 			age := int64(now.Sub(t).Seconds())
 			d.AgeSeconds = &age
-			if maxAge > 0 && now.Sub(t) > maxAge {
-				d.Problems = append(d.Problems, fmt.Sprintf("last success %s is older than %s", *d.LastSuccessAt, human(maxAge)))
+			if ages.Any > 0 && now.Sub(t) > ages.Any {
+				d.Problems = append(d.Problems, fmt.Sprintf("last success %s is older than %s", *d.LastSuccessAt, human(ages.Any)))
 			}
+		}
+		if d.LastFullSuccessAt != nil {
+			if t, ok := store.ParseTime(*d.LastFullSuccessAt); ok {
+				age := int64(now.Sub(t).Seconds())
+				d.FullAgeSeconds = &age
+				if ages.Full > 0 && now.Sub(t) > ages.Full {
+					d.Problems = append(d.Problems, fmt.Sprintf("last full success %s is older than %s", *d.LastFullSuccessAt, human(ages.Full)))
+				}
+			}
+		} else if ages.Full > 0 && d.LastSuccessAt != nil {
+			d.Problems = append(d.Problems, "never fetched in full")
 		}
 		if d.LastAttemptStatus != nil && *d.LastAttemptStatus == "failed" {
 			p := "last attempt failed"
@@ -286,14 +358,16 @@ func Check(cfg *config.Config, maxAge time.Duration, now time.Time) (*Health, er
 // ParseDuration reads "90" (seconds), "45m", "26h" or "2d".
 func ParseDuration(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
-	if strings.HasSuffix(s, "d") {
-		d, err := time.ParseDuration(strings.TrimSuffix(s, "d") + "h")
-		return d * 24, err
-	}
-	if s != "" && strings.Trim(s, "0123456789.") == "" {
+	days := strings.HasSuffix(s, "d")
+	if days {
+		s = strings.TrimSuffix(s, "d") + "h"
+	} else if s != "" && strings.Trim(s, "0123456789.") == "" {
 		s += "s"
 	}
 	d, err := time.ParseDuration(s)
+	if days {
+		d *= 24
+	}
 	if err == nil && d <= 0 {
 		err = fmt.Errorf("duration must be positive")
 	}

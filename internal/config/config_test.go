@@ -65,13 +65,16 @@ func TestLoadRejects(t *testing.T) {
 func TestCredentials(t *testing.T) {
 	env := write(t, "c.env", "# comment\nexport CENTRIC_BASE_URL=acme\nCENTRIC_USERNAME='user'\nCENTRIC_PASSWORD=\"p=w\"\n")
 	cfg := &Config{EnvFile: env}
+	// The caller's own credentials must neither leak in nor show in a failure message.
+	t.Setenv("CENTRIC_BASE_URL", "")
+	t.Setenv("CENTRIC_PASSWORD", "")
 	t.Setenv("CENTRIC_USERNAME", "from-env")
 	creds, err := cfg.LoadCredentials()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if creds.BaseURL != "acme" || creds.Username != "from-env" || creds.Password != "p=w" {
-		t.Fatalf("%+v", creds)
+		t.Fatalf("base %q user %q, password as in the file: %v", creds.BaseURL, creds.Username, creds.Password == "p=w")
 	}
 	cfg.EnvFile = write(t, "d.env", "CENTRIC_BASE_URL=x\n")
 	t.Setenv("CENTRIC_USERNAME", "")
