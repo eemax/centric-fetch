@@ -15,3 +15,7 @@ README.md says what it does and how a fetch works. Notes for changing it:
 - Endpoints come from `internal/config/catalog.go`. A new one needs its list path, API
   version and count path.
 - No output while fetching unless `-v`; the run's result is the one JSON line on stdout.
+- Release: tag `vX.Y.Z` and push the tag; ysera's pinned checkout follows tags. Tag only when
+  a box should get the change; bump the last number by default, the middle one for a change big
+  enough to name or one that breaks readers (flags, the database), and 1.0.0 only on Max's
+  say-so (his preferences, Building → Versions).
